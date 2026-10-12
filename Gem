@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>الظلام الأخير</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#000;font-family:Tahoma,Arial,sans-serif;color:#ddd;user-select:none;-webkit-user-select:none;touch-action:none}
+  canvas{position:fixed;inset:0;width:100%;height:100%}
+  #hud{position:fixed;top:12px;left:14px;right:14px;display:flex;justify-content:space-between;font-size:17px;text-shadow:0 0 6px #000;pointer-events:none}
+  #msg{position:fixed;bottom:70px;width:100%;text-align:center;font-size:20px;color:#d9a;text-shadow:0 0 8px #000;pointer-events:none;opacity:0;transition:opacity .4s}
+  #overlay{position:fixed;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;background:rgba(0,0,0,.88);text-align:center;padding:20px;box-sizing:border-box}
+  #overlay h1{color:#a00;font-size:clamp(34px,7vw,64px);margin:0 0 14px;text-shadow:0 0 22px #f00}
+  #overlay p{color:#999;max-width:560px;line-height:1.9;font-size:18px}
+  #overlay button{margin-top:22px;background:#2a0000;color:#eee;border:1px solid #700;padding:14px 38px;font-size:22px;cursor:pointer;font-family:inherit}
+  #overlay button:active{background:#500}
+  #flash{position:fixed;inset:0;background:#600;opacity:0;pointer-events:none;transition:opacity .15s}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><div id="hL"></div><div id="hR"></div></div>
+<div id="msg"></div>
+<div id="flash"></div>
+<div id="overlay">
+  <h1 id="oT">الظلام الأخير</h1>
+  <p id="oX">اجمع 3 مفاتيح، وادخل من الباب الأحمر. هو بيسمعك... وبيجري وراك.<br>
+  الحركة: WASD أو الأسهم | الجري: Shift | الكشاف: F أو الضغط بالماوس<br>
+  على الموبايل: اسحب في النص الشمال للحركة، واضغط الشمال للكشاف</p>
+  <button id="oB">ابدأ</button>
+</div>
+
+<script>
+const cv=document.getElementById('c'), ctx=cv.getContext('2d');
+const dk=document.createElement('canvas'), dctx=dk.getContext('2d');
+const overlay=document.getElementById('overlay'), oT=document.getElementById('oT'),
+      oX=document.getElementById('oX'), oB=document.getElementById('oB'),
+      hL=document.getElementById('hL'), hR=document.getElementById('hR'),
+      msgEl=document.getElementById('msg'), flashEl=document.getElementById('flash');
+let W,H;
+function resize(){W=cv.width=dk.width=innerWidth;H=cv.height=dk.height=innerHeight;}
+addEventListener('resize',resize);resize();
+
+const TILE=52, COLS=25, ROWS=21, DIRS=[[1,0],[-1,0],[0,1],[0,-1]];
+let grid,exit,keys,batteries,player,mon,pdist,state='menu',time=0,battery=100,stamina=100,
+    keysHave=0,flashOn=true,deadT=0,pathT=0,atExit=false,msgTimer=null,lastT=0;
+const down={};
+const touch={active:false,x:0,y:0,id:null,ox:0,oy:0};
+
+/* ---------- الصوت ---------- */
+let actx=null,droneGain=null,noiseBuf=null;
+function initAudio(){
+  if(actx){ if(actx.state==='suspended') actx.resume(); return; }
+  actx=new (window.AudioContext||window.webkitAudioContext)();
+  noiseBuf=actx.createBuffer(1,actx.sampleRate,actx.sampleRate);
+  const d=noiseBuf.getChannelData(0);
+  for(let i=0;i<d.length;i++) d[i]=Math.random()*2-1;
+  const drone=actx.createOscillator(); drone.type='sawtooth'; drone.frequency.value=44;
+  const lp=actx.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=160;
+  droneGain=actx.createGain(); droneGain.gain.value=0.015;
+  drone.connect(lp).connect(droneGain).connect(actx.destination); drone.start();
+}
+function thud(vol,freq){
+  if(!actx) return;
+  const o=actx.createOscillator(), g=actx.createGain(), t=actx.currentTime;
+  o.type='sine'; o.frequency.setValueAtTime(freq,t); o.frequency.exponentialRampToValueAtTime(30,t+0.25);
+  g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.3);
+  o.connect(g).connect(actx.destination); o.start(t); o.stop(t+0.35);
+}
+function scream(){
+  if(!actx) return;
+  const t=actx.currentTime, s=actx.createBufferSource(); s.buffer=noiseBuf;
+  const f=actx.createBiquadFilter(); f.type='bandpass'; f.frequency.value=1100; f.Q.value=2.5;
+  const g=actx.createGain(); g.gain.setValueAtTime(0.9,t); g.gain.exponentialRampToValueAtTime(0.001,t+1.3);
+  s.connect(f).connect(g).connect(actx.destination); s.start(t); s.stop(t+1.3);
+}
+
+/* ---------- المتاهة ---------- */
+function genMaze(){
+  grid=Array.from({length:ROWS},()=>new Array(COLS).fill(1));
+  const st=[[1,1]]; grid[1][1]=0;
+  while(st.length){
+    const [x,y]=st[st.length-1];
+    const nb=DIRS.map(([dx,dy])=>[x+dx*2,y+dy*2,dx,dy])
+      .filter(([nx,ny])=>nx>0&&ny>0&&nx<COLS-1&&ny<ROWS-1&&grid[ny][nx]===1);
+    if(!nb.length){st.pop();continue;}
+    const [nx,ny,dx,dy]=nb[Math.floor(Math.random()*nb.length)];
+    grid[y+dy][x+dx]=0; grid[ny][nx]=0; st.push([nx,ny]);
+  }
+  // نكسر شوية حيطان عشان يبقى فيه دوائر وتبقى المطاردة أصعب
+  for(let i=0;i<120;i++){
+    const x=1+Math.floor(Math.random()*(COLS-2)), y=1+Math.floor(Math.random()*(ROWS-2));
+    if(grid[y][x]===1 && ((grid[y][x-1]===0&&grid[y][x+1]===0)||(grid[y-1][x]===0&&grid[y+1][x]===0)))
+      grid[y][x]=0;
+  }
+}
+function bfs(sx,sy){
+  const d=Array.from({length:ROWS},()=>new Array(COLS).fill(Infinity));
+  d[sy][sx]=0; const q=[[sx,sy]]; let h=0;
+  while(h<q.length){
+    const [x,y]=q[h++];
+    for(const [dx,dy] of DIRS){
+      const nx=x+dx,ny=y+dy;
+      if(grid[ny][nx]===0 && d[ny][nx]===Infinity){ d[ny][nx]=d[y][x]+1; q.push([nx,ny]); }
+    }
+  }
+  return d;
+}
+function shuffle(a){for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];}}
+
+function blocked(x,y,r){
+  for(const [px,py] of [[x-r,y-r],[x+r,y-r],[x-r,y+r],[x+r,y+r]]){
+    const tx=Math.floor(px),ty=Math.floor(py);
+    if(tx<0||ty<0||tx>=COLS||ty>=ROWS||grid[ty][tx]) return true;
+  }
+  return false;
+}
+function move(e,dx,dy,r){
+  if(!blocked(e.x+dx,e.y,r)) e.x+=dx;
+  if(!blocked(e.x,e.y+dy,r)) e.y+=dy;
+}
+
+/* ---------- بدء اللعبة ---------- */
+function startGame(){
+  initAudio();
+  genMaze();
+  const open=[];
+  for(let y=0;y<ROWS;y++) for(let x=0;x<COLS;x++) if(!grid[y][x]) open.push([x,y]);
+  const sd=bfs(1,1);
+  let far=[1,1],maxd=0;
+  for(const [x,y] of open) if(sd[y][x]>maxd){maxd=sd[y][x];far=[x,y];}
+  exit={x:far[0],y:far[1]};
+  const mid=open.filter(([x,y])=>{const d=sd[y][x];return d>maxd*0.2&&d<maxd*0.95;});
+  shuffle(mid);
+  keys=mid.slice(0,3).map(([x,y])=>({x:x+.5,y:y+.5,got:false}));
+  batteries=mid.slice(3,8).map(([x,y])=>({x:x+.5,y:y+.5,got:false}));
+  const sp=open.filter(([x,y])=>{const d=sd[y][x];return d>maxd*0.45&&d<maxd*0.85;});
+  const s=sp[Math.floor(Math.random()*sp.length)];
+  mon={x:s[0]+.5,y:s[1]+.5,beatT:0,tx:null,ty:null,scared:false};
+  player={x:1.5,y:1.5};
+  pdist=sd; pathT=0; time=0; battery=100; stamina=100; keysHave=0;
+  flashOn=true; deadT=0; atExit=false; state='play';
+  overlay.style.display='none';
+  showMsg('الكشاف شغال... اسمع كويس');
+}
+
+function showOverlay(t,x,b){
+  oT.textContent=t; oX.textContent=x; oB.textContent=b;
+  overlay.style.display='flex';
+}
+function showMsg(t){
+  msgEl.textContent=t; msgEl.style.opacity=1;
+  clearTimeout(msgTimer); msgTimer=setTimeout(()=>msgEl.style.opacity=0,2500);
+}
+function toggleFlash(){
+  if(state!=='play') return;
+  if(!flashOn && battery<=0){ showMsg('البطارية خلصت'); return; }
+  flashOn=!flashOn;
+}
+function kill(){
+  state='dead'; deadT=0; scream();
+  flashEl.style.opacity='0.8';
+  setTimeout(()=>flashEl.style.opacity='0',200);
+}
+function win(){
+  state='win';
+  showOverlay('هربت!','وصلت للباب ونزلت من الظلام... لحد دلوقتي.','العب تاني');
+}
+
+/* ---------- الوحش ---------- */
+function drawMonster(sx,sy,ux,uy,S,t){
+  ctx.save(); ctx.translate(sx,sy);
+  const sway=Math.sin(t*4)*S*0.03;
+  // الإيدين والمخالب
+  for(const side of [-1,1]){
+    const shx=side*S*0.32, shy=-S*0.12;
+    const hx=ux*S*0.85+side*S*0.28, hy=uy*S*0.85+S*0.12;
+    ctx.lineCap='round';
+    ctx.strokeStyle='#0d0d0d'; ctx.lineWidth=S*0.11;
+    ctx.beginPath(); ctx.moveTo(shx,shy); ctx.lineTo(hx,hy); ctx.stroke();
+    ctx.strokeStyle='#5d5a52'; ctx.lineWidth=S*0.03; ctx.stroke();
+    const a=Math.atan2(hy-shy,hx-shx), L=S*0.3;
+    ctx.strokeStyle='#c8c4b8'; ctx.lineWidth=S*0.025;
+    for(const off of [-0.35,0,0.35]){
+      const b=a+off;
+      ctx.beginPath(); ctx.moveTo(hx,hy);
+      ctx.quadraticCurveTo(hx+Math.cos(b)*L*0.6,hy+Math.sin(b)*L*0.6,hx+Math.cos(b)*L,hy+Math.sin(b)*L);
+      ctx.stroke();
+    }
+  }
+  // العباية الممزقة
+  ctx.fillStyle='#060606'; ctx.beginPath();
+  ctx.moveTo(-S*0.05+sway,-S*0.78);
+  ctx.bezierCurveTo(S*0.45,-S*0.7,S*0.5,-S*0.1,S*0.45,S*0.5);
+  ctx.lineTo(S*0.32,S*0.38); ctx.lineTo(S*0.24,S*0.62); ctx.lineTo(S*0.08,S*0.44);
+  ctx.lineTo(-S*0.08,S*0.6); ctx.lineTo(-S*0.22,S*0.4); ctx.lineTo(-S*0.36,S*0.56);
+  ctx.lineTo(-S*0.46,S*0.3);
+  ctx.bezierCurveTo(-S*0.5,-S*0.1,-S*0.45,-S*0.7,-S*0.05+sway,-S*0.78);
+  ctx.fill();
+  // الشعر
+  ctx.strokeStyle='#0a0a0a'; ctx.lineWidth=S*0.02;
+  for(let i=0;i<16;i++){
+    const x=-S*0.34+i*S*0.045;
+    ctx.beginPath(); ctx.moveTo(x,-S*0.55);
+    ctx.quadraticCurveTo(x*1.15+sway,-S*0.1,x*1.1+sway*1.5,S*0.45+Math.sin(i)*S*0.05);
+    ctx.stroke();
+  }
+  // الوش
+  const fg=ctx.createRadialGradient(0,-S*0.2,S*0.02,0,-S*0.2,S*0.3);
+  fg.addColorStop(0,'#b5b0a2'); fg.addColorStop(1,'#3e3b35');
+  ctx.fillStyle=fg; ctx.beginPath(); ctx.ellipse(0,-S*0.2,S*0.2,S*0.26,0,0,Math.PI*2); ctx.fill();
+  // محاجر العيون
+  ctx.fillStyle='#000';
+  for(const e of [-1,1]){ctx.beginPath();ctx.ellipse(e*S*0.095,-S*0.27,S*0.08,S*0.06,e*0.3,0,Math.PI*2);ctx.fill();}
+  // الفم والأسنان
+  ctx.beginPath(); ctx.moveTo(-S*0.19,-S*0.1);
+  ctx.quadraticCurveTo(0,S*0.3,S*0.19,-S*0.1);
+  ctx.quadraticCurveTo(0,-S*0.02,-S*0.19,-S*0.1); ctx.fill();
+  ctx.fillStyle='#d9d0a8';
+  for(let i=0;i<6;i++){
+    const x=-S*0.17+i*S*0.068;
+    ctx.beginPath(); ctx.moveTo(x,-S*0.09); ctx.lineTo(x+S*0.03,-S*0.09);
+    ctx.lineTo(x+S*0.015,-S*0.01); ctx.fill();
+  }
+  ctx.restore();
+}
+function drawEyes(sx,sy,S,a,t){
+  ctx.save(); ctx.translate(sx,sy); ctx.globalAlpha=a;
+  ctx.fillStyle='#fff'; ctx.shadowColor='#fff'; ctx.shadowBlur=16+Math.sin(t*20)*4;
+  for(const e of [-1,1]){ctx.beginPath();ctx.arc(e*S*0.095,-S*0.27,Math.max(2,S*0.025),0,Math.PI*2);ctx.fill();}
+  ctx.restore();
+}
+
+/* ---------- التحديث ---------- */
+function update(dt){
+  time+=dt;
+  // الحركة
+  let ix=0,iy=0;
+  if(down.KeyA||down.ArrowLeft) ix-=1;
+  if(down.KeyD||down.ArrowRight) ix+=1;
+  if(down.KeyW||down.ArrowUp) iy-=1;
+  if(down.KeyS||down.ArrowDown) iy+=1;
+  if(touch.active){ix+=touch.x;iy+=touch.y;}
+  const L=Math.hypot(ix,iy); if(L>1){ix/=L;iy/=L;}
+  const wantRun=(down.ShiftLeft||down.ShiftRight)&&stamina>0&&L>0.1;
+  const sp=wantRun?4.4:2.9;
+  stamina=wantRun?Math.max(0,stamina-28*dt):Math.min(100,stamina+14*dt);
+  move(player,ix*sp*dt,iy*sp*dt,0.3);
+
+  // الكشاف والبطارية
+  if(flashOn){
+    battery-=2.2*dt;
+    if(battery<=0){battery=0;flashOn=false;showMsg('الكشاف خلص...');}
+  }
+
+  // الالتقاط
+  for(const k of keys) if(!k.got&&Math.hypot(player.x-k.x,player.y-k.y)<0.8){
+    k.got=true; keysHave++; showMsg(`لقيت مفتاح (${keysHave}/3)`);
+  }
+  for(const b of batteries) if(!b.got&&Math.hypot(player.x-b.x,player.y-b.y)<0.8){
+    b.got=true; battery=Math.min(100,battery+40); showMsg('لقيت بطارية');
+  }
+
+  // الباب
+  const onExit=Math.floor(player.x)===exit.x&&Math.floor(player.y)===exit.y;
+  if(onExit&&!atExit){
+    atExit=true;
+    if(keysHave>=3){win();return;}
+    showMsg('الباب مقفول... محتاج 3 مفاتيح');
+  }
+  if(!onExit) atExit=false;
+
+  // الوحش
+  pathT-=dt;
+  if(pathT<=0){pathT=0.25; pdist=bfs(Math.floor(player.x),Math.floor(player.y));}
+  const mtx=Math.floor(mon.x), mty=Math.floor(mon.y);
+  const monSpeed=2.3+Math.min(time/150,1)*1.5;
+  const cur=pdist[mty][mtx];
+  const hunting=cur<=26;
+  let tx,ty;
+  if(hunting){
+    let best=null,bd=cur;
+    for(const [dx,dy] of DIRS){
+      const nx=mtx+dx,ny=mty+dy,d=pdist[ny][nx];
+      if(d<bd){bd=d;best=[nx,ny];}
+    }
+    if(best){tx=best[0]+.5;ty=best[1]+.5;} else {tx=player.x;ty=player.y;}
+  } else {
+    if(mon.tx===null||Math.hypot(mon.tx-mon.x,mon.ty-mon.y)<0.05){
+      const opts=DIRS.map(([dx,dy])=>[mtx+dx,mty+dy]).filter(([x,y])=>!grid[y][x]);
+      const o=opts[Math.floor(Math.random()*opts.length)];
+      mon.tx=o[0]+.5; mon.ty=o[1]+.5;
+    }
+    tx=mon.tx; ty=mon.ty;
+  }
+  const ddx=tx-mon.x, ddy=ty-mon.y, dd=Math.hypot(ddx,ddy);
+  if(dd>0.0001){
+    const st=Math.min(dd,monSpeed*dt);
+    const ox0=mon.x, oy0=mon.y;
+    move(mon,ddx/dd*st,ddy/dd*st,0.35);
+    if(Math.hypot(mon.x-ox0,mon.y-oy0)<1e-5) mon.tx=null;
+  }
+
+  const dist=Math.hypot(player.x-mon.x,player.y-mon.y);
+  if(dist<2.6&&!mon.scared){mon.scared=true;scream();}
+  if(dist>5) mon.scared=false;
+  if(dist<0.6){kill();return;}
+
+  // نبض القلب والدرون حسب قرب الوحش
+  const inten=Math.max(0,Math.min(1,1-dist/10));
+  if(actx) droneGain.gain.setTargetAtTime(0.015+inten*0.06,actx.currentTime,0.3);
+  mon.beatT-=dt;
+  if(mon.beatT<=0){
+    thud(0.5+inten*0.4,80+inten*20);
+    setTimeout(()=>thud(0.3+inten*0.3,60),180);
+    mon.beatT=1.25-inten*0.85;
+  }
+
+  // الـ HUD
+  const m=Math.floor(time/60), s=Math.floor(time%60).toString().padStart(2,'0');
+  hL.textContent=`🔑 ${keysHave}/3    🔋 ${Math.round(battery)}%  ${flashOn?'💡':'🌑'}`;
+  hR.textContent=`🏃 ${Math.round(stamina)}%    ⏱ ${m}:${s}`;
+}
+
+/* ---------- الرسم ---------- */
+function drawKey(x,y){
+  ctx.save(); ctx.translate(x,y);
+  ctx.shadowColor='#fc0'; ctx.shadowBlur=12; ctx.fillStyle='#c9a227';
+  ctx.beginPath(); ctx.arc(-6,0,6,0,Math.PI*2); ctx.fill();
+  ctx.fillRect(0,-2,16,4); ctx.fillRect(10,2,3,6);
+  ctx.restore();
+}
+function drawBattery(x,y){
+  ctx.save(); ctx.translate(x,y);
+  ctx.shadowColor='#2f2'; ctx.shadowBlur=12;
+  ctx.fillStyle='#2d2'; ctx.fillRect(-7,-10,14,20);
+  ctx.fillStyle='#888'; ctx.fillRect(-3,-13,6,3);
+  ctx.restore();
+}
+
+function render(){
+  if(state==='dead'){
+    ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
+    const S=Math.min(W,H)*0.9;
+    const sh=deadT<1?(Math.random()-.5)*16:0;
+    drawMonster(W/2+sh,H/2,0,1,S,time);
+    drawEyes(W/2+sh,H/2,S,1,time);
+    ctx.fillStyle=`rgba(120,0,0,${Math.min(.6,deadT)})`; ctx.fillRect(0,0,W,H);
+    return;
+  }
+
+  ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
+  const ox=W/2-player.x*TILE, oy=H/2-player.y*TILE;
+  const x0=Math.max(0,Math.floor(-ox/TILE)-1), x1=Math.min(COLS-1,Math.ceil((W-ox)/TILE)+1);
+  const y0=Math.max(0,Math.floor(-oy/TILE)-1), y1=Math.min(ROWS-1,Math.ceil((H-oy)/TILE)+1);
+
+  for(let y=y0;y<=y1;y++) for(let x=x0;x<=x1;x++){
+    const px=ox+x*TILE, py=oy+y*TILE;
+    if(grid[y][x]){
+      ctx.fillStyle='#17110f'; ctx.fillRect(px,py,TILE,TILE);
+      ctx.fillStyle='#241b19'; ctx.fillRect(px+2,py+2,TILE-4,6);
+      ctx.fillStyle='#0b0808'; ctx.fillRect(px+4,py+TILE-8,TILE-8,4);
+    } else {
+      ctx.fillStyle=((x+y)&1)?'#0d0b0b':'#090707'; ctx.fillRect(px,py,TILE,TILE);
+    }
+  }
+
+  // الباب
+  {
+    const px=ox+exit.x*TILE, py=oy+exit.y*TILE, open=keysHave>=3;
+    ctx.fillStyle=open?'#6a0000':'#2a0505'; ctx.fillRect(px+4,py+4,TILE-8,TILE-8);
+    ctx.strokeStyle=open?'#f33':'#611'; ctx.lineWidth=3; ctx.strokeRect(px+4,py+4,TILE-8,TILE-8);
+  }
+  for(const k of keys) if(!k.got) drawKey(ox+k.x*TILE, oy+k.y*TILE);
+  for(const b of batteries) if(!b.got) drawBattery(ox+b.x*TILE, oy+b.y*TILE);
+
+  // الوحش (بيتخفى في الضلمة)
+  const msx=ox+mon.x*TILE, msy=oy+mon.y*TILE;
+  const d=Math.hypot(player.x-mon.x,player.y-mon.y)||1;
+  const ux=(player.x-mon.x)/d, uy=(player.y-mon.y)/d;
+  drawMonster(msx,msy,ux,uy,TILE*1.3,time);
+
+  // الضلمة والكشاف
+  const px=W/2, py=H/2;
+  const R=(flashOn?5.2:1.3)*TILE*(flashOn?1+Math.sin(time*37)*0.01:1);
+  dctx.clearRect(0,0,W,H);
+  dctx.globalCompositeOperation='source-over';
+  dctx.fillStyle='rgba(0,0,0,0.97)'; dctx.fillRect(0,0,W,H);
+  dctx.globalCompositeOperation='destination-out';
+  const g=dctx.createRadialGradient(px,py,R*0.15,px,py,R);
+  g.addColorStop(0,'rgba(0,0,0,1)'); g.addColorStop(0.7,'rgba(0,0,0,0.8)'); g.addColorStop(1,'rgba(0,0,0,0)');
+  dctx.fillStyle=g; dctx.beginPath(); dctx.arc(px,py,R,0,Math.PI*2); dctx.fill();
+  dctx.globalCompositeOperation='source-over';
+  ctx.drawImage(dk,0,0);
+
+  if(flashOn){
+    ctx.globalCompositeOperation='screen';
+    const wg=ctx.createRadialGradient(px,py,0,px,py,R);
+    wg.addColorStop(0,'rgba(60,40,15,0.25)'); wg.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle=wg; ctx.fillRect(px-R,py-R,R*2,R*2);
+    ctx.globalCompositeOperation='source-over';
+  }
+
+  // العيون بتلمع من الضلمة لما يقرب
+  if(d<9){
+    const a=Math.max(0,Math.min(1,(9-d)/5));
+    drawEyes(msx,msy,TILE*1.3,a,time);
+  }
+}
+
+/* ---------- الحلقة الرئيسية ---------- */
+function loop(ts){
+  const dt=lastT?Math.min(0.05,(ts-lastT)/1000):0; lastT=ts;
+  if(state==='play') update(dt);
+  else if(state==='dead'){
+    deadT+=dt;
+    if(deadT>1.6&&overlay.style.display!=='flex'){
+      showOverlay('قبضت عليك...','هو كان جنبك طول الوقت.','حاول تاني');
+    }
+  }
+  render();
+  requestAnimationFrame(loop);
+}
+
+/* ---------- التحكم ---------- */
+oB.onclick=startGame;
+addEventListener('keydown',e=>{
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+  initAudio();
+  down[e.code]=true;
+  if(e.code==='KeyF') toggleFlash();
+  if(e.code==='Enter'&&overlay.style.display==='flex') startGame();
+});
+addEventListener('keyup',e=>{down[e.code]=false;});
+cv.addEventListener('mousedown',e=>{ if(e.button===0){initAudio(); toggleFlash();} });
+
+addEventListener('touchstart',e=>{
+  if(e.target.closest&&e.target.closest('#overlay')) return;
+  initAudio();
+  for(const t of e.changedTouches){
+    if(t.clientX<W*0.6&&touch.id===null){
+      touch.id=t.identifier; touch.ox=t.clientX; touch.oy=t.clientY; touch.active=true; touch.x=0; touch.y=0;
+    } else if(t.clientX>=W*0.6){ toggleFlash(); }
+  }
+  e.preventDefault();
+},{passive:false});
+addEventListener('touchmove',e=>{
+  for(const t of e.changedTouches){
+    if(t.identifier===touch.id){
+      const dx=t.clientX-touch.ox, dy=t.clientY-touch.oy, L=Math.hypot(dx,dy);
+      const m=Math.min(1,L/50);
+      touch.x=L?dx/L*m:0; touch.y=L?dy/L*m:0;
+    }
+  }
+  e.preventDefault();
+},{passive:false});
+addEventListener('touchend',e=>{
+  for(const t of e.changedTouches){
+    if(t.identifier===touch.id){touch.id=null;touch.active=false;touch.x=0;touch.y=0;}
+  }
+});
+
+// شاشة البداية
+showOverlay('الظلام الأخير','اجمع 3 مفاتيح، وادخل من الباب الأحمر. هو بيسمعك... وبيجري وراك.\nالحركة: WASD أو الأسهم | الجري: Shift | الكشاف: F أو الضغط بالماوس\nعلى الموبايل: اسحب في النص الشمال للحركة، واضغط الشمال للكشاف','ابدأ');
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
